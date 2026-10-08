@@ -44,7 +44,7 @@ jobs:
           fi
           ls pub || true
 
-      - name: Mettre à jour satellite, cyclones, côtes et GFS monde
+      - name: Mettre à jour satellite, cyclones, côtes, GFS monde, tendance et randonnée
         run: python scripts/update_monde.py --out pub ${{ inputs.force && '--force' || '' }}
 
       - name: Publier sur la branche data
