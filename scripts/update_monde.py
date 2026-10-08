@@ -140,13 +140,19 @@ def satellite(out: Path) -> None:
         frames.append({"time": iso(t), "file": f"satellite/{name}"})
     if not frames:
         raise RuntimeError("aucune image satellite")
-    keep = {Path(f["file"]).name for f in frames}
+    keep = {Path(f["file"]).name for f in frames} | {"monde.jpg"}
     for old in sat_dir.glob("*.jpg"):
         if old.name not in keep:
             old.unlink()
+    previous = {}
+    try:
+        previous = json.loads((sat_dir / "index.json").read_text(encoding="utf-8"))
+    except Exception:
+        pass
     (sat_dir / "index.json").write_text(
         json.dumps(
             {
+                **({"world": previous["world"]} if "world" in previous else {}),
                 "generated_at": iso(datetime.now(timezone.utc)),
                 "source": "EUMETSAT — Meteosat MTG, GeoColour RGB (EUMETView)",
                 "layer": SAT_LAYER,
@@ -158,6 +164,94 @@ def satellite(out: Path) -> None:
         encoding="utf-8",
     )
     log(f"satellite : {len(frames)} images, dernière {frames[-1]['time']}")
+
+
+# Mosaïque mondiale (image la plus récente) : couleurs naturelles GeoColor là où elles existent librement
+# (GOES-Ouest, GOES-Est, Meteosat MTG), infrarouge mis en forme « nuit » ailleurs (Meteosat Océan Indien,
+# Himawari) : fond bleu nuit, nuages blancs, pour rester homogène avec GeoColor.
+GIBS = "https://gibs.earthdata.nasa.gov/wms/epsg3857/best/wms.cgi"
+WORLD_SAT_SOUTH = -65.0
+WORLD_SAT_NORTH = 70.0
+WORLD_SAT_PX_PER_DEG = 10
+WORLD_SAT_BANDS = [
+    (-180.0, -110.0, GIBS, "GOES-West_ABI_GeoColor", "rgb"),
+    (-110.0, -40.0, GIBS, "GOES-East_ABI_GeoColor", "rgb"),
+    (-40.0, 55.0, WMS, SAT_LAYER, "rgb"),
+    (55.0, 95.0, WMS, "msg_iodc:ir108", "ir:95"),
+    (95.0, 180.0, GIBS, "Himawari_AHI_Band13_Clean_Infrared", "ir:140"),
+]
+
+
+def ir_to_night(img, floor: float = 95.0):
+    """Infrarouge (gris, ou palette colorée pour les sommets très froids) -> nuages blancs sur fond bleu nuit."""
+    from PIL import Image
+
+    a = np.asarray(img.convert("RGB"), dtype=np.float32)
+    mx = a.max(axis=2)
+    mn = a.min(axis=2)
+    sat = (mx - mn) / np.maximum(mx, 1.0)
+    gray = a.mean(axis=2)
+    # sommets les plus froids (palette colorée de la NASA) : nuages très blancs, sans aplat uniforme
+    gray = np.where(sat > 0.25, 225.0 + 30.0 * np.clip(sat, 0, 1), gray)
+    # `floor` : niveau de gris du fond (mer, sol) propre à chaque source, rendu en bleu nuit
+    t = np.clip((gray - floor) / (255.0 - floor), 0.0, 1.0) ** 1.1
+    navy = np.array([14.0, 20.0, 40.0])
+    white = np.array([235.0, 238.0, 244.0])
+    out = navy[None, None, :] * (1 - t[..., None]) + white[None, None, :] * t[..., None]
+    return Image.fromarray(out.clip(0, 255).astype(np.uint8))
+
+
+def satellite_world(out: Path) -> None:
+    from PIL import Image
+    import io as _io
+
+    R = 6378137.0
+    y0 = float(mercator(WORLD_SAT_SOUTH)) * R
+    y1 = float(mercator(WORLD_SAT_NORTH)) * R
+    total_w = int(360 * WORLD_SAT_PX_PER_DEG)
+    height = round(total_w * (y1 - y0) / (2 * math.pi * R))
+    mosaic = Image.new("RGB", (total_w, height), (14, 20, 40))
+    ok = 0
+    for west, east, url, layer, kind in WORLD_SAT_BANDS:
+        w = int(round((east - west) * WORLD_SAT_PX_PER_DEG))
+        params = {
+            "SERVICE": "WMS",
+            "VERSION": "1.3.0",
+            "REQUEST": "GetMap",
+            "LAYERS": layer,
+            "STYLES": "",
+            "CRS": "EPSG:3857",
+            "BBOX": f"{math.radians(west) * R:.0f},{y0:.0f},{math.radians(east) * R:.0f},{y1:.0f}",
+            "WIDTH": str(w),
+            "HEIGHT": str(height),
+            "FORMAT": "image/jpeg",
+        }
+        try:
+            r = get(url, params=params, timeout=150)
+            if not r.headers.get("content-type", "").startswith("image/"):
+                raise RuntimeError("réponse non image")
+            img = Image.open(_io.BytesIO(r.content)).convert("RGB")
+            if kind.startswith("ir"):
+                img = ir_to_night(img, float(kind.split(":")[1]))
+            mosaic.paste(img.resize((w, height)), (int(round((west + 180) * WORLD_SAT_PX_PER_DEG)), 0))
+            ok += 1
+        except Exception as e:  # une bande manquante reste en bleu nuit
+            log("satellite monde :", layer, "indisponible :", e)
+    if ok < 3:
+        raise RuntimeError(f"mosaïque incomplète ({ok}/5 bandes)")
+    dest = out / "satellite" / "monde.jpg"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    mosaic.save(dest, "JPEG", quality=78, optimize=True, progressive=True)
+    idx_path = out / "satellite" / "index.json"
+    idx = json.loads(idx_path.read_text(encoding="utf-8")) if idx_path.exists() else {}
+    idx["world"] = {
+        "file": "satellite/monde.jpg",
+        "time": iso(datetime.now(timezone.utc)),
+        "bounds": [[WORLD_SAT_SOUTH, -180.0], [WORLD_SAT_NORTH, 180.0]],
+        "sources": "NOAA GOES-Ouest et GOES-Est GeoColor (NASA GIBS), EUMETSAT Meteosat MTG GeoColour et Meteosat Océan Indien IR, JMA Himawari IR (NASA GIBS)",
+    }
+    idx_path.write_text(json.dumps(idx, ensure_ascii=False), encoding="utf-8")
+    log(f"satellite monde : mosaïque {total_w}x{height}, {ok}/5 bandes, {dest.stat().st_size // 1024} Ko")
 
 
 # --------------------------------------------------------------------------------------------------- cyclones
@@ -402,12 +496,12 @@ def gfs_world(out: Path, force: bool) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="pub")
-    ap.add_argument("--only", default="satellite,cyclones,geo,gfs")
+    ap.add_argument("--only", default="satellite,satmonde,cyclones,geo,gfs")
     ap.add_argument("--force", action="store_true")
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    parts = {"satellite": satellite, "cyclones": cyclones, "geo": geo, "gfs": lambda o: gfs_world(o, a.force)}
+    parts = {"satellite": satellite, "satmonde": satellite_world, "cyclones": cyclones, "geo": geo, "gfs": lambda o: gfs_world(o, a.force)}
     failures = []
     for name in a.only.split(","):
         try:

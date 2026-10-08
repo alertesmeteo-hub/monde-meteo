@@ -5,6 +5,7 @@ Données lues par la carte interactive d'[app.alertes-meteo.com](https://app.ale
 | Fichier | Contenu | Source |
 | --- | --- | --- |
 | `satellite/index.json` + `satellite/*.jpg` | 10 images (toutes les 20 min, 3 dernières heures), Europe / Atlantique / Afrique du Nord, projection Web Mercator | EUMETSAT — Meteosat MTG, GeoColour RGB (EUMETView) |
+| `satellite/monde.jpg` | Mosaïque mondiale la plus récente (65° S – 70° N) : GeoColor GOES-Ouest, GOES-Est et Meteosat ; infrarouge mis en forme « nuit » pour Meteosat Océan Indien et Himawari | NOAA / NASA GIBS, EUMETSAT, JMA |
 | `maps/index.json` + `maps/values/*` | Pression au niveau de la mer et vent à 10 m, monde (80° S – 80° N), 0 à 120 h par pas de 3 h | NOAA — GFS 1° (NOMADS) |
 | `cyclones.json` | Cyclones tropicaux actifs : trajectoire observée et prévue, catégories, cône d'incertitude | GDACS (ONU / Commission européenne) |
 | `geo/monde.json` | Côtes et frontières | Natural Earth 50 m |
