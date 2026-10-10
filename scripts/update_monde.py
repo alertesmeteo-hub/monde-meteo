@@ -9,7 +9,8 @@ Publie dans un dossier (branche `data` du dépôt) :
   au même format que les dépôts régionaux (en-tête CEV1, uint16, gzip, lignes en projection Mercator) ;
 - cyclones.json : cyclones tropicaux actifs (GDACS) avec trajectoire observée et prévue, catégories et cône ;
 - geo/monde.json : côtes et frontières (Natural Earth 50 m), pour le fond de carte.
-- tendance.json : tendance à 6 semaines du modèle étendu ECMWF (EC46), anomalies hebdomadaires par zone ;
+- tendance-effis.json et tendance/ : tendance à 5 semaines, cartes d'anomalies hebdomadaires (température, pluie) du système de prévision
+  mensuelle d'ECMWF publiées par l'EFFIS (Copernicus), recadrées sur le sud-ouest de l'Europe, avec la lecture de chaque zone ;
 
 Chaque partie est indépendante : une source en panne ne bloque pas les autres, et les fichiers déjà publiés
 sont conservés (le dossier de sortie part du contenu actuel de la branche `data`).
@@ -21,10 +22,11 @@ import argparse
 import gzip
 import json
 import math
+import re
 import struct
 import tempfile
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -491,11 +493,53 @@ def gfs_world(out: Path, force: bool) -> None:
     log(f"GFS monde : {len(steps)} échéances écrites")
 
 
-# --------------------------------------------------------------------------------------------------- tendance 5 semaines
+# --------------------------------------------------------------------------------------------------- tendance à 5 semaines (cartes EFFIS)
 
-SEASONAL = "https://seasonal-api.open-meteo.com/v1/seasonal"
+# L'EFFIS (Copernicus, Commission européenne) publie des cartes d'anomalies hebdomadaires (température à 2 m en °C, pluie en mm) du système de
+# prévision mensuelle d'ECMWF sur l'Europe. Contenu de l'Union européenne sous licence CC BY 4.0 (https://forest-fire.emergency.copernicus.eu/
+# about-effis/data-license) : réutilisation permise avec mention de la source et des modifications.
+EFFIS_CARTES = "https://maps.effis.emergency.copernicus.eu/LongTermForecasts/Monthly/Europe/"
+EFFIS_APP = "https://forest-fire.emergency.copernicus.eu/apps/effis.longterm.forecasts/"
+EFFIS_VARIABLES = {"T2m": "t2m", "Rain": "pluie"}  # nom dans les fichiers EFFIS -> nom publié
 
-# Zones de la tendance : la grille du modèle étendu ECMWF (EC46) fait ~36 km, un point par grand secteur suffit.
+# Classes des cartes lues sur leurs légendes : bornes (°C ou mm) et couleurs exactes. La classe du milieu (blanche) est « proche de la normale » ;
+# au-delà des bornes extrêmes, une valeur garde la couleur de la classe extrême.
+EFFIS_CLASSES = {
+    "t2m": {
+        "unite": "°C",
+        "bornes": [-8, -7, -6, -5, -4, -3, -2, -1, -0.5, 0.5, 1, 2, 3, 4, 5, 6, 7, 8],
+        "couleurs": [
+            (0, 0, 176), (0, 36, 224), (0, 72, 255), (0, 108, 255), (0, 144, 255), (0, 180, 255), (0, 216, 255), (0, 255, 255),
+            (255, 255, 255),
+            (255, 224, 168), (255, 192, 144), (255, 160, 120), (255, 128, 96), (255, 96, 72), (255, 64, 48), (224, 32, 24), (176, 0, 0),
+        ],
+    },
+    "pluie": {
+        "unite": "mm",
+        "bornes": [-100, -80, -60, -50, -40, -30, -20, -10, -5, 5, 10, 20, 30, 40, 50, 60, 80, 100],
+        "couleurs": [
+            (176, 0, 0), (224, 32, 24), (255, 64, 48), (255, 96, 72), (255, 128, 96), (255, 160, 120), (255, 192, 144), (255, 224, 168),
+            (255, 255, 255),
+            (0, 255, 255), (0, 216, 255), (0, 180, 255), (0, 144, 255), (0, 108, 255), (0, 72, 255), (0, 36, 224), (0, 0, 176),
+        ],
+    },
+}
+
+# Géométrie des cartes : projection géographique (même échelle en longitude et en latitude), 7015 x 4960 pixels. Calage lu sur les lignes
+# pointillées du quadrillage (méridiens -25 à 55° et parallèles 25 à 75°, tous les 10°).
+EFFIS_TAILLE = (7015, 4960)
+EFFIS_X0, EFFIS_PX_LON = 662.0, 71.125  # abscisse du méridien -25° ; pixels par degré de longitude
+EFFIS_Y0, EFFIS_PX_LAT = 1047.0, 71.1  # ordonnée du parallèle 75° ; pixels par degré de latitude
+EFFIS_CADRE = (310, 880, 6699, 4779)  # intérieur du cadre de la carte : x0, y0, x1, y1
+EFFIS_LEGENDE_Y = 650
+# centre des 16 pastilles de légende (8 négatives puis 8 positives ; la zone blanche du milieu n'a pas de pastille)
+EFFIS_LEGENDE_X = [734, 1019, 1302, 1584, 1869, 2154, 2439, 2724, 4289, 4574, 4859, 5142, 5424, 5709, 5994, 6279]
+EFFIS_RECADRAGE = (-10.0, 14.0, 36.0, 51.5)  # carte publiée : longitude ouest, est, latitude sud, nord (France, péninsule ibérique, nord de l'Italie)
+EFFIS_LARGEUR = 1200  # largeur des cartes publiées (pixels)
+EFFIS_REPERE = ("Perpignan", 42.70, 2.90)
+EFFIS_RAYON = 12  # lecture d'une zone : fenêtre de (2 x rayon + 1) pixels de côté autour du point, soit environ 0,35°
+
+# Zones de la tendance : la grille du modèle étendu ECMWF fait environ 36 km, un point par grand secteur suffit.
 TENDANCE_ZONES = [
     {"id": "roussillon", "nom": "Plaine du Roussillon", "groupe": "66", "lat": 42.70, "lon": 2.90},
     {"id": "vallespir", "nom": "Vallespir et Albères", "groupe": "66", "lat": 42.45, "lon": 2.75},
@@ -506,58 +550,191 @@ TENDANCE_ZONES = [
     {"id": "toulouse", "nom": "Haute-Garonne (Toulouse)", "groupe": "Occitanie", "lat": 43.60, "lon": 1.44},
     {"id": "ariege", "nom": "Ariège (Foix)", "groupe": "Occitanie", "lat": 42.96, "lon": 1.61},
 ]
-TENDANCE_VARS = [
-    "temperature_2m_mean",
-    "temperature_2m_anomaly",
-    "temperature_2m_anomaly_gt1",
-    "temperature_2m_anomaly_ltm1",
-    "precipitation_mean",
-    "precipitation_anomaly",
-    "precipitation_anomaly_gt0",
-    "pressure_msl_anomaly",
-    "pressure_msl_anomaly_gt0",
-]
+
+
+def effis_pixel(lon: float, lat: float) -> tuple[int, int]:
+    """Pixel (x, y) d'un point sur les cartes EFFIS pleine taille."""
+    return round(EFFIS_X0 + (lon + 25.0) * EFFIS_PX_LON), round(EFFIS_Y0 + (75.0 - lat) * EFFIS_PX_LAT)
+
+
+def effis_legende(variable: str) -> dict:
+    """Classes d'une variable (« t2m » ou « pluie ») pour la page : bornes et couleur."""
+    d = EFFIS_CLASSES[variable]
+    b = d["bornes"]
+    return {"unite": d["unite"], "classes": [{"min": b[i], "max": b[i + 1], "couleur": "#%02x%02x%02x" % c} for i, c in enumerate(d["couleurs"])]}
+
+
+def effis_noms(texte: str, variable: str) -> list[tuple[int, str, date]]:
+    """Fichiers de l'index EFFIS d'une variable : (numéro de semaine, nom, date du lundi de la semaine 1), triés par semaine."""
+    rx = re.compile(rf"^Europe_MonthlyAnomalies_{variable}_(\d{{8}})_w(\d+)\.png$")
+    out = []
+    for ligne in texte.splitlines():
+        m = rx.match(ligne.strip())
+        if m:
+            out.append((int(m.group(2)), m.group(0), datetime.strptime(m.group(1), "%Y%m%d").date()))
+    return sorted(out)
+
+
+def effis_verifier(a: np.ndarray, variable: str) -> None:
+    """Vérifie que la carte a la mise en page connue (taille, cadre, quadrillage, légende). Sinon on ne lit rien : une mauvaise lecture vaut moins
+    que l'absence de donnée, et les cartes précédentes restent publiées."""
+    h, w = a.shape[:2]
+    if (w, h) != EFFIS_TAILLE:
+        raise RuntimeError(f"carte EFFIS de {w} x {h} pixels au lieu de {EFFIS_TAILLE[0]} x {EFFIS_TAILLE[1]}")
+    x0, y0, x1, y1 = EFFIS_CADRE
+    sombre = a.max(axis=-1) < 90
+    for x in (x0 - 5, x1 + 5):
+        if sombre[y0 : y1 + 1, x].mean() < 0.9:
+            raise RuntimeError("carte EFFIS : cadre vertical introuvable")
+    for y in (y0 - 5, y1 + 5):
+        if sombre[y, x0 : x1 + 1].mean() < 0.9:
+            raise RuntimeError("carte EFFIS : cadre horizontal introuvable")
+    for lon in range(-25, 56, 10):
+        x = effis_pixel(lon, 50.0)[0]
+        if sombre[y0 : y1 + 1, x - 2 : x + 3].any(axis=1).mean() < 0.15:
+            raise RuntimeError(f"carte EFFIS : méridien {lon}° absent du quadrillage")
+    for lat in range(25, 76, 10):
+        y = effis_pixel(0.0, lat)[1]
+        if sombre[y - 2 : y + 3, x0 : x1 + 1].any(axis=0).mean() < 0.15:
+            raise RuntimeError(f"carte EFFIS : parallèle {lat}° absent du quadrillage")
+    couleurs = EFFIS_CLASSES[variable]["couleurs"]
+    for x, c in zip(EFFIS_LEGENDE_X, couleurs[:8] + couleurs[9:]):
+        if tuple(int(v) for v in a[EFFIS_LEGENDE_Y, x]) != c:
+            raise RuntimeError("carte EFFIS : couleurs de la légende changées")
+
+
+def effis_classe(a: np.ndarray, lon: float, lat: float, variable: str) -> int | None:
+    """Classe de la carte (indice dans EFFIS_CLASSES) au point donné : couleur de légende la plus fréquente dans la fenêtre autour du point
+    (les traits de côtes, de frontières et de contours ne sont pas des couleurs de légende). None si aucune."""
+    x, y = effis_pixel(lon, lat)
+    r = EFFIS_RAYON
+    fen = a[max(0, y - r) : y + r + 1, max(0, x - r) : x + r + 1]
+    meilleur, n_max = None, 0
+    for i, c in enumerate(EFFIS_CLASSES[variable]["couleurs"]):
+        n = int(np.all(fen == np.array(c, dtype=fen.dtype), axis=-1).sum())
+        if n > n_max:
+            meilleur, n_max = i, n
+    return meilleur if n_max >= 100 else None
+
+
+def effis_carte(img):
+    """Carte publiée : la carte EFFIS recadrée sur le sud-ouest de l'Europe, avec un repère sur Perpignan. `img` : image Pillow RGB pleine taille."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    lon0, lon1, lat0, lat1 = EFFIS_RECADRAGE
+    x0, y0 = effis_pixel(lon0, lat1)
+    x1, y1 = effis_pixel(lon1, lat0)
+    c = img.crop((x0, y0, x1, y1))
+    w = EFFIS_LARGEUR
+    c = c.resize((w, round(c.height * w / c.width)), Image.LANCZOS)
+    nom, lat, lon = EFFIS_REPERE
+    px = (effis_pixel(lon, lat)[0] - x0) * w / (x1 - x0)
+    py = (effis_pixel(lon, lat)[1] - y0) * w / (x1 - x0)
+    d = ImageDraw.Draw(c)
+    d.ellipse((px - 9, py - 9, px + 9, py + 9), fill=(255, 255, 255))
+    d.ellipse((px - 7, py - 7, px + 7, py + 7), fill=(20, 20, 20))
+    police = ImageFont.load_default(size=20)
+    for dx in (-2, 0, 2):
+        for dy in (-2, 0, 2):
+            d.text((px + 14 + dx, py - 12 + dy), nom, font=police, fill=(255, 255, 255))
+    d.text((px + 14, py - 12), nom, font=police, fill=(20, 20, 20))
+    return c
+
+
+def effis_tete(nom: str) -> dict:
+    """ETag et date de modification d'une carte (requête HEAD, sans la télécharger)."""
+    last: Exception | None = None
+    for attempt in range(3):
+        try:
+            r = requests.head(EFFIS_CARTES + nom, timeout=30, headers=UA, allow_redirects=True)
+            if r.status_code == 200:
+                return {"etag": r.headers.get("ETag", ""), "modifie": r.headers.get("Last-Modified", "")}
+            last = RuntimeError(f"HTTP {r.status_code} sur {r.url}")
+        except requests.RequestException as e:
+            last = e
+        time.sleep(3 * (attempt + 1))
+    raise last or RuntimeError(nom)
+
+
+def effis_inchange(prev: dict | None, fichiers: dict[str, dict], dossier: Path) -> bool:
+    """Les cartes EFFIS n'ont pas changé depuis la dernière publication et nos images sont toutes là."""
+    if not prev or prev.get("schema_version") != 1 or prev.get("fichiers") != fichiers:
+        return False
+    return all((dossier / s[v]).exists() for s in prev.get("semaines", []) for v in ("t2m", "pluie"))
 
 
 def tendance(out: Path) -> None:
-    """Anomalies hebdomadaires du modèle étendu ECMWF (EC46, 51 membres) sur 6 semaines -> tendance.json."""
-    r = get(
-        SEASONAL,
-        params={
-            "latitude": ",".join(str(z["lat"]) for z in TENDANCE_ZONES),
-            "longitude": ",".join(str(z["lon"]) for z in TENDANCE_ZONES),
-            "models": "ecmwf_ec46",
-            "weekly": ",".join(TENDANCE_VARS),
-        },
-        timeout=90,
-    ).json()
-    data = r if isinstance(r, list) else [r]
-    zones = []
-    for z, d in zip(TENDANCE_ZONES, data):
-        w = d.get("weekly") or {}
-        weeks = []
-        for i, start in enumerate(w.get("time", [])):
-            row = {v: w.get(v, [None] * (i + 1))[i] for v in TENDANCE_VARS}
-            if row["temperature_2m_mean"] is None:
-                continue
-            weeks.append({"debut": start, **row})
-        if weeks:
-            zones.append({k: z[k] for k in ("id", "nom", "groupe", "lat", "lon")} | {"semaines": weeks})
-    if not zones:
-        raise RuntimeError("EC46 : aucune semaine disponible")
-    (out / "tendance.json").write_text(
-        json.dumps(
-            {
-                "generated_at": iso(datetime.now(timezone.utc)),
-                "source": "ECMWF, modèle étendu EC46 (51 membres), via Open-Meteo",
-                "zones": zones,
+    """Tendance à 5 semaines : cartes d'anomalies hebdomadaires (température, pluie) du système de prévision mensuelle d'ECMWF, lues sur l'EFFIS
+    -> tendance-effis.json (lecture de chaque zone sur les cartes) et tendance/*.webp (cartes recadrées). Rien n'est retraité tant que l'EFFIS
+    n'a pas republié ses cartes."""
+    import io
+    import shutil
+    from email.utils import parsedate_to_datetime
+
+    from PIL import Image
+
+    Image.MAX_IMAGE_PIXELS = 100_000_000
+    index = {v: effis_noms(get(f"{EFFIS_CARTES}Europe_Monthly_{v}_index.txt").text, v) for v in EFFIS_VARIABLES}
+    bases = {b for noms in index.values() for _, _, b in noms}
+    jeux = {tuple(w for w, _, _ in noms) for noms in index.values()}
+    if len(bases) != 1 or len(jeux) != 1 or len(next(iter(jeux))) < 4:
+        raise RuntimeError(f"index EFFIS inattendu : dates {sorted(bases)}, semaines {sorted(jeux)}")
+    base = next(iter(bases))
+    fichiers = {nom: effis_tete(nom) for noms in index.values() for _, nom, _ in noms}
+    dest = out / "tendance-effis.json"
+    prev = None
+    try:
+        prev = json.loads(dest.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    if effis_inchange(prev, fichiers, out):
+        log("tendance : cartes EFFIS inchangées")
+        return
+
+    zones = [{k: z[k] for k in ("id", "nom", "groupe", "lat", "lon")} | {"semaines": []} for z in TENDANCE_ZONES]
+    semaines = []
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        (tmp_dir / "tendance").mkdir()
+        for rang in range(len(index["T2m"])):
+            debut = base + timedelta(days=7 * (index["T2m"][rang][0] - 1))
+            ligne = {"debut": debut.isoformat(), "fin": (debut + timedelta(days=6)).isoformat()}
+            lectures: dict[str, dict] = {z["id"]: {} for z in TENDANCE_ZONES}
+            for var, noms in index.items():
+                pub = EFFIS_VARIABLES[var]
+                nom = noms[rang][1]
+                img = Image.open(io.BytesIO(get(EFFIS_CARTES + nom, timeout=180).content)).convert("RGB")
+                arr = np.asarray(img)
+                effis_verifier(arr, pub)
+                for z in TENDANCE_ZONES:
+                    lectures[z["id"]][pub] = effis_classe(arr, z["lon"], z["lat"], pub)
+                fichier = f"tendance/{pub}-{rang + 1}.webp"
+                effis_carte(img).save(tmp_dir / fichier, "WEBP", quality=92, method=6)
+                ligne[pub] = fichier
+                del img, arr
+            semaines.append(ligne)
+            for z in zones:
+                z["semaines"].append(lectures[z["id"]])
+        modifie = max(parsedate_to_datetime(f["modifie"]) for f in fichiers.values() if f["modifie"])
+        doc = {
+            "schema_version": 1,
+            "generated_at": iso(datetime.now(timezone.utc)),
+            "publie": iso(modifie),
+            "source": {
+                "nom": "EFFIS (Copernicus, Union européenne), d'après le système de prévision mensuelle d'ECMWF",
+                "url": EFFIS_APP,
+                "licence": "CC BY 4.0",
+                "modifications": "cartes recadrées sur le sud-ouest de l'Europe, repère de Perpignan ajouté ; valeurs des zones lues sur les cartes",
             },
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ),
-        encoding="utf-8",
-    )
-    log(f"tendance : {len(zones)} zones, {len(zones[0]['semaines'])} semaines")
+            "semaines": semaines,
+            "legendes": {v: effis_legende(v) for v in EFFIS_VARIABLES.values()},
+            "zones": zones,
+            "fichiers": fichiers,
+        }
+        shutil.rmtree(out / "tendance", ignore_errors=True)
+        shutil.copytree(tmp_dir / "tendance", out / "tendance")
+    dest.write_text(json.dumps(doc, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    log(f"tendance : {len(semaines)} semaines (du {semaines[0]['debut']} au {semaines[-1]['fin']}), cartes EFFIS publiées le {doc['publie']}")
 
 
 # --------------------------------------------------------------------------------------------------- main
