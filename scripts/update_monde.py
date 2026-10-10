@@ -750,6 +750,8 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
     # La météo randonnée est maintenant calculée par le site avec ses propres modèles (/api/randonnee) : on retire l'ancien fichier.
     (out / "randonnee.json").unlink(missing_ok=True)
+    # La tendance à 5 semaines vient des cartes de l'EFFIS (tendance-effis.json) : on retire l'ancien fichier EC46 d'Open-Meteo.
+    (out / "tendance.json").unlink(missing_ok=True)
     parts = {"satellite": satellite, "satmonde": satellite_world, "cyclones": cyclones, "geo": geo, "gfs": lambda o: gfs_world(o, a.force), "tendance": tendance}
     failures = []
     for name in a.only.split(","):
