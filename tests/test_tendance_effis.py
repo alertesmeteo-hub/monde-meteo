@@ -91,10 +91,13 @@ class Calage(unittest.TestCase):
             l = um.effis_legende(v)
             self.assertEqual(len(l["classes"]), 17)
             self.assertEqual((l["classes"][8]["min"], l["classes"][8]["max"]), (-0.5, 0.5) if v == "t2m" else (-5, 5))
-            self.assertEqual(l["classes"][8]["couleur"], "#ffffff")
-        self.assertEqual(um.effis_legende("t2m")["classes"][16], {"min": 7, "max": 8, "couleur": "#b00000"})
-        # chaud en rouge et sec en rouge aussi : les deux palettes vont du rouge (valeurs fortes négatives pour la pluie) au bleu
-        self.assertEqual(um.effis_legende("pluie")["classes"][0]["couleur"], "#b00000")
+            self.assertEqual(l["unite"], "°C" if v == "t2m" else "mm")
+        self.assertEqual(um.effis_legende("t2m")["classes"][16], {"min": 7, "max": 8})
+        self.assertEqual(um.effis_legende("pluie")["classes"][0], {"min": -100, "max": -80})
+        # chaque classe est entre ses deux bornes, sans trou
+        for v in ("t2m", "pluie"):
+            c = um.effis_legende(v)["classes"]
+            self.assertTrue(all(a["max"] == b["min"] for a, b in zip(c, c[1:])))
 
 
 class Lecture(unittest.TestCase):
@@ -146,20 +149,6 @@ class Lecture(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "méridien 15"):
             um.effis_verifier(np.asarray(img), "t2m")
 
-    def test_carte_publiee(self):
-        img = fausse_carte("t2m", self.zones)
-        c = um.effis_carte(img)
-        self.assertEqual(c.width, um.EFFIS_LARGEUR)
-        lon0, lon1, lat0, lat1 = um.EFFIS_RECADRAGE
-        attendu_h = round((um.effis_pixel(0, lat0)[1] - um.effis_pixel(0, lat1)[1]) * um.EFFIS_LARGEUR / (um.effis_pixel(lon1, 0)[0] - um.effis_pixel(lon0, 0)[0]))
-        self.assertEqual(c.height, attendu_h)
-        # le repère de Perpignan : un rond sombre au bon endroit
-        x0, y0 = um.effis_pixel(lon0, lat1)
-        facteur = um.EFFIS_LARGEUR / (um.effis_pixel(lon1, 0)[0] - x0)
-        _, lat, lon = um.EFFIS_REPERE
-        px, py = (um.effis_pixel(lon, lat)[0] - x0) * facteur, (um.effis_pixel(lon, lat)[1] - y0) * facteur
-        self.assertEqual(c.getpixel((round(px), round(py))), (20, 20, 20))
-
 
 class Orchestration(unittest.TestCase):
     NOMS = {v: [f"Europe_MonthlyAnomalies_{v}_20261005_w{w}.png" for w in range(2, 6)] for v in ("T2m", "Rain")}
@@ -189,17 +178,16 @@ class Orchestration(unittest.TestCase):
             out = Path(tmp)
             um.tendance(out)
             doc = json.loads((out / "tendance-effis.json").read_text(encoding="utf-8"))
+            self.assertEqual(doc["schema_version"], 2)
             self.assertEqual(doc["publie"], "2026-10-09T20:20:08Z")
-            self.assertEqual([s["debut"] for s in doc["semaines"]], ["2026-10-12", "2026-10-19", "2026-10-26", "2026-11-02"])
-            self.assertEqual(doc["semaines"][0]["fin"], "2026-10-18")
-            self.assertEqual(sorted(p.name for p in (out / "tendance").iterdir()), sorted(f"{v}-{r}.webp" for v in ("t2m", "pluie") for r in range(1, 5)))
+            self.assertEqual(doc["semaines"], [{"debut": "2026-10-12", "fin": "2026-10-18"}, {"debut": "2026-10-19", "fin": "2026-10-25"}, {"debut": "2026-10-26", "fin": "2026-11-01"}, {"debut": "2026-11-02", "fin": "2026-11-08"}])
             self.assertEqual(len(doc["zones"]), 8)
             for z in doc["zones"]:
                 self.assertEqual(z["semaines"], [{"t2m": 10, "pluie": 5}] * 4)
-            self.assertEqual(doc["legendes"]["t2m"]["classes"][10]["min"], 1)
+            self.assertEqual(doc["legendes"]["t2m"]["classes"][10], {"min": 1, "max": 2})
+            self.assertEqual(doc["legendes"]["pluie"]["classes"][5], {"min": -30, "max": -20})
             self.assertEqual(doc["source"]["licence"], "CC BY 4.0")
-            with Image.open(out / "tendance" / "t2m-1.webp") as im:
-                self.assertEqual(im.width, um.EFFIS_LARGEUR)
+            self.assertEqual(sorted(p.name for p in out.iterdir()), ["tendance-effis.json"])  # aucune carte publiée
 
     def test_pas_de_retraitement_si_rien_n_a_change(self):
         with tempfile.TemporaryDirectory() as tmp, self.installer():
@@ -221,13 +209,15 @@ class Orchestration(unittest.TestCase):
             apres = json.loads((out / "tendance-effis.json").read_text(encoding="utf-8"))
             self.assertNotEqual(avant["fichiers"], apres["fichiers"])
 
-    def test_image_manquante_relance_le_traitement(self):
+    def test_ancien_format_relance_le_traitement(self):
         with tempfile.TemporaryDirectory() as tmp, self.installer():
             out = Path(tmp)
             um.tendance(out)
-            (out / "tendance" / "pluie-2.webp").unlink()
+            doc = json.loads((out / "tendance-effis.json").read_text(encoding="utf-8"))
+            doc["schema_version"] = 1
+            (out / "tendance-effis.json").write_text(json.dumps(doc), encoding="utf-8")
             um.tendance(out)
-            self.assertTrue((out / "tendance" / "pluie-2.webp").exists())
+            self.assertEqual(json.loads((out / "tendance-effis.json").read_text(encoding="utf-8"))["schema_version"], 2)
 
     def test_index_incoherent(self):
         noms = {"T2m": self.NOMS["T2m"], "Rain": [n.replace("20261005", "20261012") for n in self.NOMS["Rain"]]}
@@ -248,7 +238,26 @@ class Orchestration(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     um.tendance(out)
             self.assertFalse((out / "tendance-effis.json").exists())
-            self.assertFalse((out / "tendance").exists())
+
+
+class Nettoyage(unittest.TestCase):
+    def test_effis_inchange(self):
+        f = {"a.png": {"etag": '"1"', "modifie": "x"}}
+        self.assertTrue(um.effis_inchange({"schema_version": 2, "fichiers": f}, f))
+        self.assertFalse(um.effis_inchange({"schema_version": 1, "fichiers": f}, f))
+        self.assertFalse(um.effis_inchange({"schema_version": 2, "fichiers": {"a.png": {"etag": '"2"', "modifie": "x"}}}, f))
+        self.assertFalse(um.effis_inchange(None, f))
+
+    def test_anciens_fichiers_retires(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / "tendance").mkdir()
+            (out / "tendance" / "t2m-1.webp").write_bytes(b"x")
+            for nom in ("randonnee.json", "tendance.json", "tendance-effis.json", "cyclones.json"):
+                (out / nom).write_text("{}", encoding="utf-8")
+            um.retirer_anciens_fichiers(out)
+            self.assertEqual(sorted(p.name for p in out.iterdir()), ["cyclones.json", "tendance-effis.json"])
+            um.retirer_anciens_fichiers(out)  # sans erreur quand il n'y a plus rien
 
 
 if __name__ == "__main__":

@@ -9,8 +9,8 @@ Publie dans un dossier (branche `data` du dépôt) :
   au même format que les dépôts régionaux (en-tête CEV1, uint16, gzip, lignes en projection Mercator) ;
 - cyclones.json : cyclones tropicaux actifs (GDACS) avec trajectoire observée et prévue, catégories et cône ;
 - geo/monde.json : côtes et frontières (Natural Earth 50 m), pour le fond de carte.
-- tendance-effis.json et tendance/ : tendance à 5 semaines, cartes d'anomalies hebdomadaires (température, pluie) du système de prévision
-  mensuelle d'ECMWF publiées par l'EFFIS (Copernicus), recadrées sur le sud-ouest de l'Europe, avec la lecture de chaque zone ;
+- tendance-effis.json : tendance à 5 semaines, écarts hebdomadaires à la normale (température, pluie) du système de prévision mensuelle
+  d'ECMWF, lus par zone sur les cartes publiées par l'EFFIS (Copernicus) ;
 
 Chaque partie est indépendante : une source en panne ne bloque pas les autres, et les fichiers déjà publiés
 sont conservés (le dossier de sortie part du contenu actuel de la branche `data`).
@@ -497,7 +497,8 @@ def gfs_world(out: Path, force: bool) -> None:
 
 # L'EFFIS (Copernicus, Commission européenne) publie des cartes d'anomalies hebdomadaires (température à 2 m en °C, pluie en mm) du système de
 # prévision mensuelle d'ECMWF sur l'Europe. Contenu de l'Union européenne sous licence CC BY 4.0 (https://forest-fire.emergency.copernicus.eu/
-# about-effis/data-license) : réutilisation permise avec mention de la source et des modifications.
+# about-effis/data-license) : réutilisation permise avec mention de la source et des modifications. On lit la classe de couleur de la carte au
+# point de chaque zone ; les cartes elles-mêmes ne sont pas republiées.
 EFFIS_CARTES = "https://maps.effis.emergency.copernicus.eu/LongTermForecasts/Monthly/Europe/"
 EFFIS_APP = "https://forest-fire.emergency.copernicus.eu/apps/effis.longterm.forecasts/"
 EFFIS_VARIABLES = {"T2m": "t2m", "Rain": "pluie"}  # nom dans les fichiers EFFIS -> nom publié
@@ -534,9 +535,6 @@ EFFIS_CADRE = (310, 880, 6699, 4779)  # intérieur du cadre de la carte : x0, y0
 EFFIS_LEGENDE_Y = 650
 # centre des 16 pastilles de légende (8 négatives puis 8 positives ; la zone blanche du milieu n'a pas de pastille)
 EFFIS_LEGENDE_X = [734, 1019, 1302, 1584, 1869, 2154, 2439, 2724, 4289, 4574, 4859, 5142, 5424, 5709, 5994, 6279]
-EFFIS_RECADRAGE = (-10.0, 14.0, 36.0, 51.5)  # carte publiée : longitude ouest, est, latitude sud, nord (France, péninsule ibérique, nord de l'Italie)
-EFFIS_LARGEUR = 1200  # largeur des cartes publiées (pixels)
-EFFIS_REPERE = ("Perpignan", 42.70, 2.90)
 EFFIS_RAYON = 12  # lecture d'une zone : fenêtre de (2 x rayon + 1) pixels de côté autour du point, soit environ 0,35°
 
 # Zones de la tendance : la grille du modèle étendu ECMWF fait environ 36 km, un point par grand secteur suffit.
@@ -558,10 +556,10 @@ def effis_pixel(lon: float, lat: float) -> tuple[int, int]:
 
 
 def effis_legende(variable: str) -> dict:
-    """Classes d'une variable (« t2m » ou « pluie ») pour la page : bornes et couleur."""
+    """Classes d'une variable (« t2m » ou « pluie ») pour la page : unité et bornes de chaque classe, dans l'ordre des couleurs de la carte."""
     d = EFFIS_CLASSES[variable]
     b = d["bornes"]
-    return {"unite": d["unite"], "classes": [{"min": b[i], "max": b[i + 1], "couleur": "#%02x%02x%02x" % c} for i, c in enumerate(d["couleurs"])]}
+    return {"unite": d["unite"], "classes": [{"min": b[i], "max": b[i + 1]} for i in range(len(d["couleurs"]))]}
 
 
 def effis_noms(texte: str, variable: str) -> list[tuple[int, str, date]]:
@@ -617,30 +615,6 @@ def effis_classe(a: np.ndarray, lon: float, lat: float, variable: str) -> int | 
     return meilleur if n_max >= 100 else None
 
 
-def effis_carte(img):
-    """Carte publiée : la carte EFFIS recadrée sur le sud-ouest de l'Europe, avec un repère sur Perpignan. `img` : image Pillow RGB pleine taille."""
-    from PIL import Image, ImageDraw, ImageFont
-
-    lon0, lon1, lat0, lat1 = EFFIS_RECADRAGE
-    x0, y0 = effis_pixel(lon0, lat1)
-    x1, y1 = effis_pixel(lon1, lat0)
-    c = img.crop((x0, y0, x1, y1))
-    w = EFFIS_LARGEUR
-    c = c.resize((w, round(c.height * w / c.width)), Image.LANCZOS)
-    nom, lat, lon = EFFIS_REPERE
-    px = (effis_pixel(lon, lat)[0] - x0) * w / (x1 - x0)
-    py = (effis_pixel(lon, lat)[1] - y0) * w / (x1 - x0)
-    d = ImageDraw.Draw(c)
-    d.ellipse((px - 9, py - 9, px + 9, py + 9), fill=(255, 255, 255))
-    d.ellipse((px - 7, py - 7, px + 7, py + 7), fill=(20, 20, 20))
-    police = ImageFont.load_default(size=20)
-    for dx in (-2, 0, 2):
-        for dy in (-2, 0, 2):
-            d.text((px + 14 + dx, py - 12 + dy), nom, font=police, fill=(255, 255, 255))
-    d.text((px + 14, py - 12), nom, font=police, fill=(20, 20, 20))
-    return c
-
-
 def effis_tete(nom: str) -> dict:
     """ETag et date de modification d'une carte (requête HEAD, sans la télécharger)."""
     last: Exception | None = None
@@ -656,19 +630,18 @@ def effis_tete(nom: str) -> dict:
     raise last or RuntimeError(nom)
 
 
-def effis_inchange(prev: dict | None, fichiers: dict[str, dict], dossier: Path) -> bool:
-    """Les cartes EFFIS n'ont pas changé depuis la dernière publication et nos images sont toutes là."""
-    if not prev or prev.get("schema_version") != 1 or prev.get("fichiers") != fichiers:
-        return False
-    return all((dossier / s[v]).exists() for s in prev.get("semaines", []) for v in ("t2m", "pluie"))
+EFFIS_SCHEMA = 2
+
+
+def effis_inchange(prev: dict | None, fichiers: dict[str, dict]) -> bool:
+    """Les cartes EFFIS n'ont pas changé depuis la dernière lecture (et le fichier publié a la forme actuelle)."""
+    return bool(prev) and prev.get("schema_version") == EFFIS_SCHEMA and prev.get("fichiers") == fichiers
 
 
 def tendance(out: Path) -> None:
-    """Tendance à 5 semaines : cartes d'anomalies hebdomadaires (température, pluie) du système de prévision mensuelle d'ECMWF, lues sur l'EFFIS
-    -> tendance-effis.json (lecture de chaque zone sur les cartes) et tendance/*.webp (cartes recadrées). Rien n'est retraité tant que l'EFFIS
-    n'a pas republié ses cartes."""
+    """Tendance à 5 semaines : écarts hebdomadaires à la normale (température, pluie) du système de prévision mensuelle d'ECMWF, lus par zone sur
+    les cartes de l'EFFIS -> tendance-effis.json. Rien n'est relu tant que l'EFFIS n'a pas republié ses cartes."""
     import io
-    import shutil
     from email.utils import parsedate_to_datetime
 
     from PIL import Image
@@ -687,54 +660,54 @@ def tendance(out: Path) -> None:
         prev = json.loads(dest.read_text(encoding="utf-8"))
     except Exception:
         pass
-    if effis_inchange(prev, fichiers, out):
+    if effis_inchange(prev, fichiers):
         log("tendance : cartes EFFIS inchangées")
         return
 
     zones = [{k: z[k] for k in ("id", "nom", "groupe", "lat", "lon")} | {"semaines": []} for z in TENDANCE_ZONES]
     semaines = []
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_dir = Path(tmp)
-        (tmp_dir / "tendance").mkdir()
-        for rang in range(len(index["T2m"])):
-            debut = base + timedelta(days=7 * (index["T2m"][rang][0] - 1))
-            ligne = {"debut": debut.isoformat(), "fin": (debut + timedelta(days=6)).isoformat()}
-            lectures: dict[str, dict] = {z["id"]: {} for z in TENDANCE_ZONES}
-            for var, noms in index.items():
-                pub = EFFIS_VARIABLES[var]
-                nom = noms[rang][1]
-                img = Image.open(io.BytesIO(get(EFFIS_CARTES + nom, timeout=180).content)).convert("RGB")
-                arr = np.asarray(img)
-                effis_verifier(arr, pub)
-                for z in TENDANCE_ZONES:
-                    lectures[z["id"]][pub] = effis_classe(arr, z["lon"], z["lat"], pub)
-                fichier = f"tendance/{pub}-{rang + 1}.webp"
-                effis_carte(img).save(tmp_dir / fichier, "WEBP", quality=92, method=6)
-                ligne[pub] = fichier
-                del img, arr
-            semaines.append(ligne)
-            for z in zones:
-                z["semaines"].append(lectures[z["id"]])
-        modifie = max(parsedate_to_datetime(f["modifie"]) for f in fichiers.values() if f["modifie"])
-        doc = {
-            "schema_version": 1,
-            "generated_at": iso(datetime.now(timezone.utc)),
-            "publie": iso(modifie),
-            "source": {
-                "nom": "EFFIS (Copernicus, Union européenne), d'après le système de prévision mensuelle d'ECMWF",
-                "url": EFFIS_APP,
-                "licence": "CC BY 4.0",
-                "modifications": "cartes recadrées sur le sud-ouest de l'Europe, repère de Perpignan ajouté ; valeurs des zones lues sur les cartes",
-            },
-            "semaines": semaines,
-            "legendes": {v: effis_legende(v) for v in EFFIS_VARIABLES.values()},
-            "zones": zones,
-            "fichiers": fichiers,
-        }
-        shutil.rmtree(out / "tendance", ignore_errors=True)
-        shutil.copytree(tmp_dir / "tendance", out / "tendance")
+    for rang in range(len(index["T2m"])):
+        debut = base + timedelta(days=7 * (index["T2m"][rang][0] - 1))
+        semaines.append({"debut": debut.isoformat(), "fin": (debut + timedelta(days=6)).isoformat()})
+        lectures: dict[str, dict] = {z["id"]: {} for z in TENDANCE_ZONES}
+        for var, noms in index.items():
+            pub = EFFIS_VARIABLES[var]
+            img = Image.open(io.BytesIO(get(EFFIS_CARTES + noms[rang][1], timeout=180).content)).convert("RGB")
+            arr = np.asarray(img)
+            effis_verifier(arr, pub)
+            for z in TENDANCE_ZONES:
+                lectures[z["id"]][pub] = effis_classe(arr, z["lon"], z["lat"], pub)
+            del img, arr
+        for z in zones:
+            z["semaines"].append(lectures[z["id"]])
+    modifie = max(parsedate_to_datetime(f["modifie"]) for f in fichiers.values() if f["modifie"])
+    doc = {
+        "schema_version": EFFIS_SCHEMA,
+        "generated_at": iso(datetime.now(timezone.utc)),
+        "publie": iso(modifie),
+        "source": {
+            "nom": "EFFIS (Copernicus, Union européenne), d'après le système de prévision mensuelle d'ECMWF",
+            "url": EFFIS_APP,
+            "licence": "CC BY 4.0",
+            "modifications": "valeurs des zones lues sur les cartes (classe de la légende au point de la zone)",
+        },
+        "semaines": semaines,
+        "legendes": {v: effis_legende(v) for v in EFFIS_VARIABLES.values()},
+        "zones": zones,
+        "fichiers": fichiers,
+    }
     dest.write_text(json.dumps(doc, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     log(f"tendance : {len(semaines)} semaines (du {semaines[0]['debut']} au {semaines[-1]['fin']}), cartes EFFIS publiées le {doc['publie']}")
+
+
+def retirer_anciens_fichiers(out: Path) -> None:
+    """Fichiers d'anciennes versions, à ne plus publier : météo randonnée (calculée par le site avec ses modèles), tendance EC46 d'Open-Meteo et
+    cartes recadrées de la tendance."""
+    import shutil
+
+    (out / "randonnee.json").unlink(missing_ok=True)
+    (out / "tendance.json").unlink(missing_ok=True)
+    shutil.rmtree(out / "tendance", ignore_errors=True)
 
 
 # --------------------------------------------------------------------------------------------------- main
@@ -748,10 +721,7 @@ def main() -> int:
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    # La météo randonnée est maintenant calculée par le site avec ses propres modèles (/api/randonnee) : on retire l'ancien fichier.
-    (out / "randonnee.json").unlink(missing_ok=True)
-    # La tendance à 5 semaines vient des cartes de l'EFFIS (tendance-effis.json) : on retire l'ancien fichier EC46 d'Open-Meteo.
-    (out / "tendance.json").unlink(missing_ok=True)
+    retirer_anciens_fichiers(out)
     parts = {"satellite": satellite, "satmonde": satellite_world, "cyclones": cyclones, "geo": geo, "gfs": lambda o: gfs_world(o, a.force), "tendance": tendance}
     failures = []
     for name in a.only.split(","):
