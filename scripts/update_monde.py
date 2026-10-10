@@ -10,7 +10,6 @@ Publie dans un dossier (branche `data` du dépôt) :
 - cyclones.json : cyclones tropicaux actifs (GDACS) avec trajectoire observée et prévue, catégories et cône ;
 - geo/monde.json : côtes et frontières (Natural Earth 50 m), pour le fond de carte.
 - tendance.json : tendance à 6 semaines du modèle étendu ECMWF (EC46), anomalies hebdomadaires par zone ;
-- randonnee.json : prévisions horaires à 7 jours au sommet et au départ des randonnées des Pyrénées-Orientales.
 
 Chaque partie est indépendante : une source en panne ne bloque pas les autres, et les fichiers déjà publiés
 sont conservés (le dossier de sortie part du contenu actuel de la branche `data`).
@@ -494,7 +493,6 @@ def gfs_world(out: Path, force: bool) -> None:
 
 # --------------------------------------------------------------------------------------------------- tendance 5 semaines
 
-OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
 SEASONAL = "https://seasonal-api.open-meteo.com/v1/seasonal"
 
 # Zones de la tendance : la grille du modèle étendu ECMWF (EC46) fait ~36 km, un point par grand secteur suffit.
@@ -562,118 +560,20 @@ def tendance(out: Path) -> None:
     log(f"tendance : {len(zones)} zones, {len(zones[0]['semaines'])} semaines")
 
 
-# --------------------------------------------------------------------------------------------------- randonnée
-
-# Coordonnées approchées des sommets et des départs ; l'altitude donnée sert à corriger la température du modèle.
-RANDOS = [
-    {"id": "canigou", "nom": "Pic du Canigou", "massif": "Canigou", "sommet": [42.5189, 2.4567, 2784], "depart": ["Refuge de Mariailles", 42.5414, 2.3975, 1718]},
-    {"id": "puigmal", "nom": "Puigmal d'Err", "massif": "Cerdagne", "sommet": [42.3836, 2.1167, 2910], "depart": ["Ancienne station Puigmal 2900", 42.4080, 2.1070, 1900]},
-    {"id": "carlit", "nom": "Pic Carlit", "massif": "Carlit", "sommet": [42.5711, 1.9353, 2921], "depart": ["Lac des Bouillouses", 42.5603, 1.9958, 2015]},
-    {"id": "cambre-aze", "nom": "Cambre d'Aze", "massif": "Cerdagne", "sommet": [42.4700, 2.0720, 2750], "depart": ["Saint-Pierre-dels-Forcats", 42.4878, 2.1086, 1600]},
-    {"id": "bastiments", "nom": "Pic de Bastiments", "massif": "Haut-Vallespir", "sommet": [42.4240, 2.2260, 2881], "depart": ["Vallter 2000", 42.4250, 2.2650, 2000]},
-    {"id": "costabonne", "nom": "Pic de Costabonne", "massif": "Haut-Vallespir", "sommet": [42.4025, 2.3608, 2465], "depart": ["La Preste", 42.4044, 2.4053, 1130]},
-    {"id": "madres", "nom": "Pic de Madrès", "massif": "Madrès", "sommet": [42.7375, 2.2253, 2469], "depart": ["Col de Jau", 42.6920, 2.2620, 1506]},
-    {"id": "roc-france", "nom": "Roc de France", "massif": "Vallespir", "sommet": [42.4194, 2.6778, 1450], "depart": ["Las Illas", 42.4325, 2.7203, 550]},
-    {"id": "neulos", "nom": "Pic Neulós", "massif": "Albères", "sommet": [42.4836, 2.9439, 1256], "depart": ["Col de l'Ouillat", 42.4760, 2.9130, 936]},
-    {"id": "massane", "nom": "Tour de la Massane", "massif": "Albères", "sommet": [42.4908, 3.0400, 792], "depart": ["Argelès, château de Valmy", 42.5350, 3.0240, 70]},
-    {"id": "madeloc", "nom": "Tour de Madeloc", "massif": "Côte Vermeille", "sommet": [42.4940, 3.0840, 652], "depart": ["Collioure", 42.5256, 3.0833, 10]},
-    {"id": "forca-real", "nom": "Ermitage de Força Réal", "massif": "Aspres et Ribéral", "sommet": [42.7556, 2.6578, 507], "depart": ["Millas", 42.6939, 2.6967, 100]},
-    {"id": "galamus", "nom": "Gorges de Galamus", "massif": "Fenouillèdes", "sommet": [42.8440, 2.4700, 450], "depart": ["Saint-Paul-de-Fenouillet", 42.8100, 2.5050, 260]},
-]
-RANDO_HOURLY = [
-    "temperature_2m",
-    "apparent_temperature",
-    "precipitation",
-    "precipitation_probability",
-    "weather_code",
-    "wind_speed_10m",
-    "wind_gusts_10m",
-    "wind_direction_10m",
-    "cloud_cover",
-    "freezing_level_height",
-    "snowfall",
-    "cape",
-    "visibility",
-]
-# Valeurs utiles au départ (le reste n'est lu qu'au sommet).
-RANDO_DEPART = ["temperature_2m", "apparent_temperature", "precipitation", "wind_gusts_10m", "weather_code"]
-
-
-def _compact(v):
-    if v is None:
-        return None
-    return round(v) if abs(v) >= 10 else round(v, 1)
-
-
-def randonnee(out: Path) -> None:
-    """Prévisions horaires à 7 jours au sommet et au départ des randonnées -> randonnee.json."""
-    pts = [(r["sommet"][0], r["sommet"][1], r["sommet"][2]) for r in RANDOS] + [(r["depart"][1], r["depart"][2], r["depart"][3]) for r in RANDOS]
-    res = get(
-        OPEN_METEO,
-        params={
-            "latitude": ",".join(str(p[0]) for p in pts),
-            "longitude": ",".join(str(p[1]) for p in pts),
-            "elevation": ",".join(str(p[2]) for p in pts),
-            "hourly": ",".join(RANDO_HOURLY),
-            "daily": "sunrise,sunset,uv_index_max",
-            "timezone": "Europe/Paris",
-            "forecast_days": 7,
-        },
-        timeout=90,
-    ).json()
-    if not isinstance(res, list) or len(res) != len(pts):
-        raise RuntimeError("Open-Meteo : réponse inattendue pour les randonnées")
-    n = len(RANDOS)
-    times = res[0]["hourly"]["time"]
-    items = []
-    for i, r in enumerate(RANDOS):
-        top, low = res[i], res[n + i]
-        items.append(
-            {
-                "id": r["id"],
-                "nom": r["nom"],
-                "massif": r["massif"],
-                "sommet": {"lat": r["sommet"][0], "lon": r["sommet"][1], "alt": r["sommet"][2]},
-                "depart": {"nom": r["depart"][0], "lat": r["depart"][1], "lon": r["depart"][2], "alt": r["depart"][3]},
-                "h": {v: [_compact(x) for x in top["hourly"][v]] for v in RANDO_HOURLY},
-                "hd": {v: [_compact(x) for x in low["hourly"][v]] for v in RANDO_DEPART},
-                "jours": {
-                    "date": top["daily"]["time"],
-                    "lever": [s[-5:] for s in top["daily"]["sunrise"]],
-                    "coucher": [s[-5:] for s in top["daily"]["sunset"]],
-                    "uv": top["daily"]["uv_index_max"],
-                },
-            }
-        )
-    (out / "randonnee.json").write_text(
-        json.dumps(
-            {
-                "generated_at": iso(datetime.now(timezone.utc)),
-                "source": "Open-Meteo (Météo-France AROME/ARPEGE, ECMWF), température corrigée de l'altitude",
-                "fuseau": "Europe/Paris",
-                "heures": times,
-                "randos": items,
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ),
-        encoding="utf-8",
-    )
-    log(f"randonnée : {n} itinéraires, {len(times)} heures")
-
-
 # --------------------------------------------------------------------------------------------------- main
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="pub")
-    ap.add_argument("--only", default="satellite,satmonde,cyclones,geo,gfs,tendance,randonnee")
+    ap.add_argument("--only", default="satellite,satmonde,cyclones,geo,gfs,tendance")
     ap.add_argument("--force", action="store_true")
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    parts = {"satellite": satellite, "satmonde": satellite_world, "cyclones": cyclones, "geo": geo, "gfs": lambda o: gfs_world(o, a.force), "tendance": tendance, "randonnee": randonnee}
+    # La météo randonnée est maintenant calculée par le site avec ses propres modèles (/api/randonnee) : on retire l'ancien fichier.
+    (out / "randonnee.json").unlink(missing_ok=True)
+    parts = {"satellite": satellite, "satmonde": satellite_world, "cyclones": cyclones, "geo": geo, "gfs": lambda o: gfs_world(o, a.force), "tendance": tendance}
     failures = []
     for name in a.only.split(","):
         try:
