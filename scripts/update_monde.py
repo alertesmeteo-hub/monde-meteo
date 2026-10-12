@@ -11,6 +11,8 @@ Publie dans un dossier (branche `data` du dépôt) :
 - geo/monde.json : côtes et frontières (Natural Earth 50 m), pour le fond de carte.
 - tendance-effis.json : tendance à 5 semaines, écarts hebdomadaires à la normale (température, pluie) du système de prévision mensuelle
   d'ECMWF, lus par zone sur les cartes publiées par l'EFFIS (Copernicus) ;
+- tendance-modeles.json : recoupement des semaines couvertes par nos modèles CEP et GFS (15 jours), écart à la normale 1991-2020 d'une
+  station de référence par zone ;
 
 Chaque partie est indépendante : une source en panne ne bloque pas les autres, et les fichiers déjà publiés
 sont conservés (le dossier de sortie part du contenu actuel de la branche `data`).
@@ -700,6 +702,169 @@ def tendance(out: Path) -> None:
     log(f"tendance : {len(semaines)} semaines (du {semaines[0]['debut']} au {semaines[-1]['fin']}), cartes EFFIS publiées le {doc['publie']}")
 
 
+# --------------------------------------------------------------------------------------------------- recoupement par nos modèles (15 jours)
+
+# Les semaines que couvrent nos modèles déterministes (CEP et GFS, 15 jours) sont recoupées avec la tendance : écart à la normale 1991-2020
+# d'une station Météo-France proche de chaque zone (normales officielles du dépôt climato), calculé comme sur les cartes (moyenne de la
+# semaine, cumul de pluie de la semaine). Fichiers des modèles : branche data de leurs dépôts, un fichier par département.
+RECOUPEMENT_DEPOT = "https://raw.githubusercontent.com/alertesmeteo-hub/{depot}/data/"
+RECOUPEMENT_MODELES = {"cep": "CEP (ECMWF IFS)", "gfs": "GFS (NOAA)"}
+RECOUPEMENT_NORMALES = "https://raw.githubusercontent.com/alertesmeteo-hub/climato/data/stations/{station}/normales.json"
+# zone -> département du fichier modèle, puis station de référence : numéro, nom, latitude, longitude, altitude (m)
+RECOUPEMENT_STATIONS = {
+    "roussillon": ("66", "66136001", "Perpignan", 42.7372, 2.8728, 42),
+    "vallespir": ("66", "66137003", "Le Perthus", 42.4733, 2.8595, 295),
+    "conflent": ("66", "66074002", "Eus", 42.6302, 2.4463, 321),
+    "cerdagne": ("66", "66082004", "Formiguères", 42.6160, 2.1113, 1495),
+    "aude": ("11", "11069001", "Carcassonne", 43.2153, 2.2955, 128),
+    "herault": ("34", "34154001", "Montpellier-Aéroport", 43.5762, 3.9647, 1),
+    "toulouse": ("31", "31069001", "Toulouse-Blagnac", 43.6210, 1.3788, 151),
+    "ariege": ("09", "09099001", "Cos", 42.9702, 1.5645, 519),
+}
+RECOUPEMENT_GRADIENT = 0.0065  # °C par mètre : température du point de grille ramenée à l'altitude de la station
+RECOUPEMENT_RAYON_PLUIE_KM = 25.0  # pluie : moyenne des points de grille à moins de 25 km de la station (un point isolé est trop bruité)
+RECOUPEMENT_JOURS_MIN = 3  # une semaine n'est publiée que si le modèle en couvre au moins 3 jours complets
+RECOUPEMENT_SCHEMA = 1
+
+
+def km_entre(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    return 111.2 * math.hypot(lat2 - lat1, (lon2 - lon1) * math.cos(math.radians((lat1 + lat2) / 2)))
+
+
+def normale_du_jour(mois: dict[int, dict], jour: date) -> tuple[float, float]:
+    """Normale d'un jour : température moyenne interpolée entre les milieux de mois, pluie = normale du mois répartie sur ses jours."""
+    import calendar
+
+    def milieu(a: int, m: int) -> date:
+        return date(a, m, 1) + timedelta(days=(calendar.monthrange(a, m)[1] - 1) / 2)
+
+    m = jour.month
+    c = milieu(jour.year, m)
+    if jour >= c:
+        a2, m2 = (jour.year + 1, 1) if m == 12 else (jour.year, m + 1)
+    else:
+        a2, m2 = (jour.year - 1, 12) if m == 1 else (jour.year, m - 1)
+    poids = abs((jour - c).days) / abs((milieu(a2, m2) - c).days)
+    tm = mois[m]["tm_moy"] * (1 - poids) + mois[m2]["tm_moy"] * poids
+    return tm, mois[m]["rr_moy"] / calendar.monthrange(jour.year, m)[1]
+
+
+def semaines_modele(m: dict, station: tuple, normales: dict[int, dict]) -> list[dict]:
+    """Semaines (du lundi au dimanche, jours UTC) couvertes par un fichier départemental d'un modèle, au droit d'une station : température
+    moyenne (00, 06, 12 et 18 UTC du point de grille le plus proche, ramenée à l'altitude de la station), cumul de pluie (points à moins de
+    25 km) et normales des mêmes jours."""
+    _, _, _, lat, lon, alt = station
+    pts = m["points"]
+    vals = m["columns"]["values"]
+    it, ip = vals.index("temperature_c"), vals.index("precipitation_total_mm")
+    dist = [km_entre(lat, lon, p[1], p[2]) for p in pts]
+    proche = min(range(len(pts)), key=dist.__getitem__)
+    autour = [i for i, d in enumerate(dist) if d <= RECOUPEMENT_RAYON_PLUIE_KM] or [proche]
+    correction = RECOUPEMENT_GRADIENT * ((pts[proche][3] or 0) - alt)
+
+    temperatures: dict[date, list[float]] = {}
+    cumuls: dict[datetime, float] = {}
+    for t, lignes in m["forecast"]:
+        dt = datetime.fromisoformat(t.replace("Z", "+00:00"))
+        if dt.hour % 6 == 0 and dt.minute == 0 and lignes[proche][it] is not None:
+            temperatures.setdefault(dt.date(), []).append(lignes[proche][it] + correction)
+        if dt.hour == 0 and dt.minute == 0:
+            v = [lignes[i][ip] for i in autour if lignes[i][ip] is not None]
+            if len(v) == len(autour):
+                cumuls[dt] = sum(v) / len(v)
+
+    def minuit(j: date) -> datetime:
+        return datetime(j.year, j.month, j.day, tzinfo=timezone.utc)
+
+    # un jour est complet avec ses 4 températures et le cumul de pluie à ses deux minuits (le cumul part de 0 au début du run)
+    complets = sorted(j for j, v in temperatures.items() if len(v) == 4 and minuit(j) in cumuls and minuit(j + timedelta(days=1)) in cumuls)
+    par_semaine: dict[date, list[date]] = {}
+    for j in complets:
+        par_semaine.setdefault(j - timedelta(days=j.weekday()), []).append(j)
+    out = []
+    for debut, jours in sorted(par_semaine.items()):
+        if len(jours) < RECOUPEMENT_JOURS_MIN or (jours[-1] - jours[0]).days != len(jours) - 1:
+            continue
+        norm = [normale_du_jour(normales, j) for j in jours]
+        out.append({
+            "debut": debut.isoformat(),
+            "du": jours[0].isoformat(),
+            "au": jours[-1].isoformat(),
+            "jours": len(jours),
+            "t": round(sum(sum(temperatures[j]) / 4 for j in jours) / len(jours), 1),
+            "t_normale": round(sum(n[0] for n in norm) / len(norm), 1),
+            "pluie": round(cumuls[minuit(jours[-1] + timedelta(days=1))] - cumuls[minuit(jours[0])], 1),
+            "pluie_normale": round(sum(n[1] for n in norm), 1),
+        })
+    return out
+
+
+def recoupement(out: Path) -> None:
+    """Recoupement de la tendance par le CEP et le GFS -> tendance-modeles.json. Rien n'est recalculé tant que les deux modèles n'ont pas
+    publié de nouveau run ; un modèle indisponible garde ses valeurs précédentes."""
+    dest = out / "tendance-modeles.json"
+    prev = None
+    try:
+        prev = json.loads(dest.read_text(encoding="utf-8"))
+        if prev.get("schema_version") != RECOUPEMENT_SCHEMA:
+            prev = None
+    except Exception:
+        pass
+    runs: dict[str, str] = {}
+    for cle in RECOUPEMENT_MODELES:
+        try:
+            runs[cle] = get(RECOUPEMENT_DEPOT.format(depot=cle) + "index.json").json()["model"]["run_time"]
+        except Exception as e:
+            log(f"recoupement : index {cle} illisible ({e})")
+    if prev and all(prev["modeles"].get(c, {}).get("run") == r for c, r in runs.items()):
+        log("recoupement : runs CEP et GFS inchangés")
+        return
+
+    normales = {}
+    for zid, st in RECOUPEMENT_STATIONS.items():
+        doc = get(RECOUPEMENT_NORMALES.format(station=st[1])).json()
+        normales[zid] = {m["mois"]: m for m in doc["months"]}
+    zones = {zid: {"id": zid, "station": {"id": st[1], "nom": st[2], "alt": st[5]}, "modeles": {}} for zid, st in RECOUPEMENT_STATIONS.items()}
+    modeles: dict[str, dict] = {}
+    for cle, nom in RECOUPEMENT_MODELES.items():
+        ancien = (prev or {}).get("modeles", {}).get(cle)
+        try:
+            if cle not in runs:
+                raise RuntimeError("index illisible")
+            if ancien and ancien.get("run") == runs[cle]:
+                raise RuntimeError("run inchangé")
+            deps = sorted({s[0] for s in RECOUPEMENT_STATIONS.values()})
+            fichiers = {d: get(RECOUPEMENT_DEPOT.format(depot=cle) + f"departements/{d}.json", timeout=120).json() for d in deps}
+            for zid, st in RECOUPEMENT_STATIONS.items():
+                zones[zid]["modeles"][cle] = semaines_modele(fichiers[st[0]], st, normales[zid])
+            modeles[cle] = {"nom": nom, "run": runs[cle]}
+        except Exception as e:
+            if not ancien:
+                log(f"recoupement : {cle} absent ({e})")
+                continue
+            modeles[cle] = ancien
+            for z in prev["zones"]:
+                if cle in z["modeles"] and z["id"] in zones:
+                    zones[z["id"]]["modeles"][cle] = z["modeles"][cle]
+            if str(e) != "run inchangé":
+                log(f"recoupement : {cle} non mis à jour ({e}), valeurs précédentes conservées")
+    if not modeles:
+        raise RuntimeError("aucun modèle lisible")
+    doc = {
+        "schema_version": RECOUPEMENT_SCHEMA,
+        "generated_at": iso(datetime.now(timezone.utc)),
+        "modeles": modeles,
+        "normales": "normales 1991-2020 de Météo-France (station de référence de chaque zone)",
+        "methode": (
+            "semaines du lundi au dimanche ; température : moyenne de 00, 06, 12 et 18 UTC au point de grille le plus proche de la station, "
+            "ramenée à son altitude (0,65°C pour 100 m) ; pluie : cumul de la semaine, moyenne des points de grille à moins de 25 km"
+        ),
+        "zones": list(zones.values()),
+    }
+    dest.write_text(json.dumps(doc, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    log("recoupement : " + ", ".join(f"{c} run {m['run']}" for c, m in modeles.items()))
+
+
 def retirer_anciens_fichiers(out: Path) -> None:
     """Fichiers d'anciennes versions, à ne plus publier : météo randonnée (calculée par le site avec ses modèles), tendance EC46 d'Open-Meteo et
     cartes recadrées de la tendance."""
@@ -716,13 +881,13 @@ def retirer_anciens_fichiers(out: Path) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="pub")
-    ap.add_argument("--only", default="satellite,satmonde,cyclones,geo,gfs,tendance")
+    ap.add_argument("--only", default="satellite,satmonde,cyclones,geo,gfs,tendance,recoupement")
     ap.add_argument("--force", action="store_true")
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     retirer_anciens_fichiers(out)
-    parts = {"satellite": satellite, "satmonde": satellite_world, "cyclones": cyclones, "geo": geo, "gfs": lambda o: gfs_world(o, a.force), "tendance": tendance}
+    parts = {"satellite": satellite, "satmonde": satellite_world, "cyclones": cyclones, "geo": geo, "gfs": lambda o: gfs_world(o, a.force), "tendance": tendance, "recoupement": recoupement}
     failures = []
     for name in a.only.split(","):
         try:

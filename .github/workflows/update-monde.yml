@@ -44,7 +44,7 @@ jobs:
           fi
           ls pub || true
 
-      - name: Mettre à jour satellite, cyclones, côtes, GFS monde et tendance (cartes EFFIS)
+      - name: Mettre à jour satellite, cyclones, côtes, GFS monde, tendance (cartes EFFIS) et recoupement CEP/GFS
         run: python scripts/update_monde.py --out pub ${{ inputs.force && '--force' || '' }}
 
       - name: Publier sur la branche data
